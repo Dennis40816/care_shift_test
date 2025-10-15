@@ -5,6 +5,9 @@ from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional
 from playwright.sync_api import Page
 
+from care_shift_test.utils import log
+import time
+
 # ---------- DOM → raw rows ----------
 
 _JS_EXTRACT = r"""
@@ -192,8 +195,100 @@ def upsert_shifts(conn: sqlite3.Connection, rows: List[Dict[str, Any]]) -> int:
     )
     return cur.rowcount or 0
 
+def set_people_page_size(page: Page, size: int = 100,
+                         timeout_ms: int = 12000,
+                         stable_ms: int = 3000,
+                         poll_ms: int = 200) -> int:
+    btn = page.locator("#pageDropDown").first
+    btn.wait_for(state="visible", timeout=timeout_ms)
+    btn.scroll_into_view_if_needed()
+
+    rows = page.locator("tbody .user-col")
+    try:
+        prev = rows.count()
+    except Exception:
+        prev = -1
+
+    # 展開選單並點選 size
+    btn.click()
+    menu = page.locator(
+        ".dropdown-menu[aria-labelledby='pageDropDown'], "
+        "#pageDropDown ~ .dropdown-menu, "
+        ".open .dropdown-menu"
+    ).first
+    menu.wait_for(state="visible", timeout=2000)
+
+    item = menu.locator(f"[role='menuitem'][data-page='{size}']").first
+    if item.count() == 0:
+        item = page.locator(f"[role='menuitem'][data-page='{size}']").first
+    if item.count() == 0:
+        raise RuntimeError(f"page-size item not found: data-page='{size}'")
+
+    item.scroll_into_view_if_needed()
+    item.click()
+
+    # Phase 1：選單關閉
+    page.wait_for_function(
+        """
+        () => {
+          const menu =
+            document.querySelector(".dropdown-menu[aria-labelledby='pageDropDown']") ||
+            document.querySelector("#pageDropDown ~ .dropdown-menu") ||
+            document.querySelector(".open .dropdown-menu");
+          return !(menu && menu.offsetParent);
+        }
+        """,
+        timeout=min(3000, timeout_ms)
+    )
+
+    # Phase 2：列數連續穩定 stable_ms，含倒計時日誌
+    start = time.monotonic()
+    last_change = time.monotonic()
+    last_rows = -1
+    last_logged_sec = None
+
+    def count_rows() -> int:
+        try:
+            return page.evaluate("() => document.querySelectorAll('tbody .user-col').length")
+        except Exception:
+            return 0
+
+    last_rows = count_rows()
+    last_change = time.monotonic()
+
+    while True:
+        n = count_rows()
+        now = time.monotonic()
+        if n != last_rows:
+            last_rows = n
+            last_change = now
+
+        stable_secs = now - last_change
+        remain = max(0.0, stable_ms/1000.0 - stable_secs)
+        # 每秒記一次 log
+        sec_int = int(remain) + (1 if remain > 0 else 0)
+        if sec_int != last_logged_sec:
+            log("INFO", "page-size", f"stable countdown: {sec_int}s, rows={n}")
+            last_logged_sec = sec_int
+
+        if stable_secs >= stable_ms/1000.0 and n > 0:
+            break
+
+        if (now - start) * 1000 > timeout_ms:
+            raise TimeoutError(f"page size change not stabilized in {timeout_ms}ms, rows={n}")
+
+        page.wait_for_timeout(min(poll_ms, int(remain * 1000)) if remain > 0 else poll_ms)
+
+    curr = last_rows
+    log("INFO", "page-size", f"set to {size}, rows={curr}, prev={prev}")
+    return curr
+
+
 def import_week_shifts(page: Page, db_path: str, week_start: str | date) -> int:
     """High-level: DOM→rows→DB. week_start is this view's Sunday date."""
+    # show 100 employee first
+    set_people_page_size(page, 100)
+    
     ws = _coerce_week_start(week_start)
     raw = extract_week_raw(page)
     rows = normalize_rows(raw, ws)
