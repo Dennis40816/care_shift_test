@@ -7,7 +7,7 @@ from datetime import date, timedelta
 from playwright.sync_api import Page
 from care_shift_test.utils import log
 from stack import start_stack, stop_stack
-from login import login
+from login import login2 as login
 from go_to_week_shift import go_to_week_shift
 from week_shift_import import import_week_shifts
 
@@ -35,9 +35,13 @@ def stage_import(page: Page) -> Page:
     default_db = "shifts.db"
     default_week = _sunday_of(date.today()).strftime("%Y-%m-%d")
 
-    db_path = (input(f"DB path [{default_db}]: ").strip() or default_db)
-    week_start = (input(f"Week start Sunday YYYY-MM-DD [{default_week}]: ").strip() or default_week)
+    ## TODO: 增加這個功能
+    # db_path = (input(f"DB path [{default_db}]: ").strip() or default_db)
+    # week_start = (input(f"Week start Sunday YYYY-MM-DD [{default_week}]: ").strip() or default_week)
 
+    db_path = default_db
+    week_start = _sunday_of(date.today()).strftime("%Y-%m-%d")
+    
     # 直接匯入；假設目前就在週檢視。若不是，請先跑 stage_shift。
     log("INFO", "import", f"start import -> db={db_path}, week_start={week_start}")
     try:

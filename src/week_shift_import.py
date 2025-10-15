@@ -197,7 +197,7 @@ def upsert_shifts(conn: sqlite3.Connection, rows: List[Dict[str, Any]]) -> int:
 
 def set_people_page_size(page: Page, size: int = 100,
                          timeout_ms: int = 12000,
-                         stable_ms: int = 3000,
+                         stable_ms: int = 5000,
                          poll_ms: int = 200) -> int:
     btn = page.locator("#pageDropDown").first
     btn.wait_for(state="visible", timeout=timeout_ms)
