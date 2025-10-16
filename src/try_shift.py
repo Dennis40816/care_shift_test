@@ -234,19 +234,42 @@ def run_try_shift(
         emp_slots_cache: Dict[int, Dict[str, set[datetime]]] = {}
 
         def get_emp_slots(slot_min: int) -> Dict[str, set[datetime]]:
-            cache = emp_slots_cache.get(slot_min)
-            if cache is None:
-                cache = {
-                    emp: {slot for a, b in ivs for slot in discretize(a, b, slot_min)}
-                    for emp, ivs in emp_intervals.items()
-                }
-                emp_slots_cache[slot_min] = cache
-                log(
-                    "DEBUG",
-                    "try-shift",
-                    f"built emp-slots for slot_min={slot_min} (employees={len(cache)})",
-                )
-            return cache
+            """Return employees' FREE slots in the target week, not busy ones.
+
+            We treat rows in table 'shifts' as BUSY intervals. So free = week_grid - busy.
+            """
+            key = ("free", slot_min)
+            cache = emp_slots_cache.get(key)
+            if cache is not None:
+                return cache
+
+            # build week grid: [week_start 00:00, week_end 00:00) by slot_min
+            week_start = _sunday_of(week_any)
+            grid_start = datetime(week_start.year, week_start.month, week_start.day, 0, 0)
+            grid_end = grid_start + timedelta(days=7)
+            step = timedelta(minutes=slot_min)
+
+            all_slots: set[datetime] = set()
+            cur = grid_start
+            while cur < grid_end:
+                all_slots.add(cur)
+                cur += step
+
+            # busy slots from DB intervals
+            busy_map: Dict[str, set[datetime]] = {
+                emp: {slot for a, b in ivs for slot in discretize(a, b, slot_min)}
+                for emp, ivs in emp_intervals.items()
+            }
+
+            # free = all - busy
+            free_map: Dict[str, set[datetime]] = {
+                emp: (all_slots - busy_slots) for emp, busy_slots in busy_map.items()
+            }
+
+            emp_slots_cache[key] = free_map
+            log("DEBUG", "try-shift",
+                f"built emp FREE-slots for slot_min={slot_min} (employees={len(free_map)})")
+            return free_map
 
         def greedy_pick(
             req_intervals: List[Tuple[datetime, datetime]],
@@ -392,13 +415,46 @@ def run_try_shift(
 
             lines.append(f"== {case.case_id} (slot={slot_min}m, k<={use_k}) ==")
             if all_candidates:
-                lines.append(f"Candidates ({len(all_candidates)}):")
+                # compute relaxed-need and build per-employee FREE slots
                 need_slots_relaxed = None
                 if forced_relax_minutes is not None:
                     need_slots_relaxed = set(
                         slots_union(_relax_intervals(req_intervals, forced_relax_minutes), slot_min)
                     )
                 emp_slots_for_case = get_emp_slots(slot_min)
+
+                # --- conflict filtering (busy vs needed) ---
+                # build BUSY map from DB intervals using the same slot granularity
+                busy_map = {
+                    emp: {
+                        slot
+                        for a, b in emp_intervals.get(emp, [])
+                        for slot in discretize(a, b, slot_min)
+                    }
+                    for emp in emp_intervals.keys()
+                }
+
+                def has_conflict(team: Tuple[str, ...], need_slots: set[datetime]) -> bool:
+                    """return True if any team member is busy on any needed slot"""
+                    return any((busy_map.get(emp, set()) & need_slots) for emp in team)
+
+                filtered: List[Candidate] = []
+                for cand in all_candidates:
+                    need_slots_for_team = (
+                        need_slots_baseline
+                        if (not cand.tag or cand.tag == "baseline")
+                        else need_slots_relaxed
+                    )
+                    if need_slots_for_team is None:
+                        need_slots_for_team = need_slots_baseline
+                    if has_conflict(cand.team, need_slots_for_team):
+                        log("WARN", "try-shift", f"{case.case_id}: drop team {cand.team} due to busy conflict")
+                        continue
+                    filtered.append(cand)
+                all_candidates = filtered
+                # --- end conflict filtering ---
+
+                lines.append(f"Candidates ({len(all_candidates)}):")
                 for idx, cand in enumerate(all_candidates, start=1):
                     tag_suffix = f" [{cand.tag}]" if cand.tag and cand.tag != "baseline" else ""
                     lines.append(
@@ -429,6 +485,7 @@ def run_try_shift(
                             lines.append(f"     - {emp_name}: {interval}")
             else:
                 lines.append("Candidates (0): none")
+
 
             if not all_candidates:
                 missing_slots = compute_missing(req_intervals, slot_min)
