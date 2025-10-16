@@ -16,16 +16,20 @@ DEFAULT_DB = "shifts.db"
 DEFAULT_REQ_PATH = "shift_req.json"
 DEFAULT_K = 3
 DEFAULT_RELAX_MIN = 30
+DEFAULT_SLOT_MIN = SLOT_MIN
+
+DAY_LABELS = ["一", "二", "三", "四", "五", "六", "日"]
 
 
 @dataclass
 class CaseReq:
     case_id: str
-    week_date: Optional[str]  # YYYY-MM-DD in the target week, optional
-    days: Dict[str, List[str]]  # e.g., {"mon":["09:00-11:00", ...], ...}
-    specific: List[Dict[str, Any]]  # [{"date":"YYYY-MM-DD","ranges":["HH:MM-HH:MM",...]}]
+    week_date: Optional[str]
+    days: Dict[str, List[str]]
+    specific: List[Dict[str, Any]]
     k: Optional[int]
     backup_strategy: Optional[Dict[str, Any]] = None
+    slot_min: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -64,7 +68,6 @@ def _inflate_intervals(
     specific: List[Dict[str, Any]],
     week_any: date,
 ) -> List[Tuple[datetime, datetime]]:
-    """Convert a days mapping and specific overrides into datetime intervals for the target week."""
     out: List[Tuple[datetime, datetime]] = []
     week = _week_dates(week_any)
     for key, ranges in (days or {}).items():
@@ -93,28 +96,27 @@ def _relax_intervals(intervals: List[Tuple[datetime, datetime]], minutes: int) -
 
 
 def _load_emp_intervals(conn: sqlite3.Connection, week_any: date) -> Dict[str, List[Tuple[datetime, datetime]]]:
-    """Load employee intervals for the whole target week."""
+    """Load employee availability intervals for the entire target week."""
     start = _sunday_of(week_any)
     end = start + timedelta(days=7)
-    q = (
+    query = (
         "SELECT employee_name, date, start_min, end_min FROM shifts "
         "WHERE date >= ? AND date < ?"
     )
-    rows = conn.execute(q, (start.isoformat(), end.isoformat())).fetchall()
+    rows = conn.execute(query, (start.isoformat(), end.isoformat())).fetchall()
     emp: Dict[str, List[Tuple[datetime, datetime]]] = {}
     for name, ds, sm, em in rows:
-        d0 = datetime.fromisoformat(ds).date()
-        st = datetime(d0.year, d0.month, d0.day) + timedelta(minutes=int(sm))
-        et = datetime(d0.year, d0.month, d0.day) + timedelta(minutes=int(em))
-        if et <= st:
+        base_date = datetime.fromisoformat(ds).date()
+        start_dt = datetime(base_date.year, base_date.month, base_date.day) + timedelta(minutes=int(sm))
+        end_dt = datetime(base_date.year, base_date.month, base_date.day) + timedelta(minutes=int(em))
+        if end_dt <= start_dt:
             continue
-        emp.setdefault(name or "", []).append((st, et))
+        emp.setdefault(name or "", []).append((start_dt, end_dt))
     return emp
 
 
-def _merge_slots(slots: Iterable[datetime]) -> List[Tuple[datetime, datetime]]:
-    """Merge adjacent SLOT_MIN-spaced slots into intervals for readable output."""
-    step = timedelta(minutes=SLOT_MIN)
+def _merge_slots(slots: Iterable[datetime], minutes: int) -> List[Tuple[datetime, datetime]]:
+    step = timedelta(minutes=minutes)
     out: List[Tuple[datetime, datetime]] = []
     cur_start: Optional[datetime] = None
     prev: Optional[datetime] = None
@@ -134,8 +136,16 @@ def _merge_slots(slots: Iterable[datetime]) -> List[Tuple[datetime, datetime]]:
     return out
 
 
-def _format_intervals(iv: Iterable[Tuple[datetime, datetime]]) -> List[str]:
-    return [f"{a.strftime('%Y-%m-%d %H:%M')} - {b.strftime('%H:%M')}" for a, b in iv]
+def _format_intervals(iv: Iterable[Tuple[datetime, datetime]], minutes: int) -> List[str]:
+    def sort_key(interval: Tuple[datetime, datetime]) -> Tuple[int, datetime, datetime]:
+        start, end = interval
+        return ((start.weekday() + 1) % 7, start, end)
+
+    formatted: List[str] = []
+    for a, b in sorted(iv, key=sort_key):
+        label = DAY_LABELS[a.weekday()]
+        formatted.append(f"({label}) {a.strftime('%Y-%m-%d %H:%M')} - {b.strftime('%H:%M')}")
+    return formatted
 
 
 def run_try_shift(
@@ -146,7 +156,7 @@ def run_try_shift(
     log("INFO", "try-shift", f"load req from {req_path}")
     try:
         text = Path(req_path).read_text(encoding="utf-8")
-    except FileNotFoundError as exc:
+    except FileNotFoundError:
         log("ERROR", "try-shift", f"request file not found: {req_path}")
         raise
     log("DEBUG", "try-shift", f"req size={len(text)} bytes")
@@ -169,6 +179,20 @@ def run_try_shift(
     cases: List[CaseReq] = []
     for idx, case_data in enumerate(raw_cases, 1):
         cid = case_data.get("case_id") or case_data.get("name") or f"case-{idx}"
+        slot_min_val = case_data.get("slot_min")
+        slot_min: Optional[int]
+        if slot_min_val is None:
+            slot_min = None
+        else:
+            try:
+                slot_min = int(slot_min_val)
+            except (TypeError, ValueError):
+                log("ERROR", "try-shift", f"case {cid}: invalid slot_min {slot_min_val}")
+                raise
+            if slot_min <= 0:
+                log("ERROR", "try-shift", f"case {cid}: slot_min must be > 0")
+                raise ValueError("slot_min must be positive")
+
         case = CaseReq(
             case_id=cid,
             week_date=case_data.get("week_date") or None,
@@ -176,13 +200,14 @@ def run_try_shift(
             specific=case_data.get("specific") or [],
             k=case_data.get("k"),
             backup_strategy=case_data.get("backup_strategy") or None,
+            slot_min=slot_min,
         )
         cases.append(case)
         day_segments = sum(len(v) for v in case.days.values())
         log(
             "DEBUG",
             "try-shift",
-            f"parsed case[{idx}] id={cid} day_ranges={day_segments} specific={len(case.specific)} k={case.k}",
+            f"parsed case[{idx}] id={cid} day_ranges={day_segments} specific={len(case.specific)} k={case.k} slot_min={case.slot_min}",
         )
 
     if not cases:
@@ -205,18 +230,32 @@ def run_try_shift(
             emp: sum(int((b - a).total_seconds() // 60) for a, b in ivs)
             for emp, ivs in emp_intervals.items()
         }
-        emp_slots: Dict[str, set[datetime]] = {
-            emp: {slot for a, b in ivs for slot in discretize(a, b, SLOT_MIN)}
-            for emp, ivs in emp_intervals.items()
-        }
-        log("DEBUG", "try-shift", f"precomputed slots for {len(emp_slots)} employees")
+
+        emp_slots_cache: Dict[int, Dict[str, set[datetime]]] = {}
+
+        def get_emp_slots(slot_min: int) -> Dict[str, set[datetime]]:
+            cache = emp_slots_cache.get(slot_min)
+            if cache is None:
+                cache = {
+                    emp: {slot for a, b in ivs for slot in discretize(a, b, slot_min)}
+                    for emp, ivs in emp_intervals.items()
+                }
+                emp_slots_cache[slot_min] = cache
+                log(
+                    "DEBUG",
+                    "try-shift",
+                    f"built emp-slots for slot_min={slot_min} (employees={len(cache)})",
+                )
+            return cache
 
         def greedy_pick(
             req_intervals: List[Tuple[datetime, datetime]],
             k: int,
+            slot_min: int,
             seed: Optional[List[str]] = None,
         ) -> Tuple[List[str], List[datetime]]:
-            need = set(slots_union(req_intervals, SLOT_MIN))
+            emp_slots = get_emp_slots(slot_min)
+            need = set(slots_union(req_intervals, slot_min))
             picked: List[str] = []
             covered: set[datetime] = set()
             if seed:
@@ -248,11 +287,13 @@ def run_try_shift(
         def generate_candidates(
             req_intervals: List[Tuple[datetime, datetime]],
             k: int,
-            max_seeds: int = 12,
+            slot_min: int,
             *,
             tag: str = "baseline",
+            max_seeds: int = 12,
         ) -> List[Candidate]:
-            need = set(slots_union(req_intervals, SLOT_MIN))
+            emp_slots = get_emp_slots(slot_min)
+            need = set(slots_union(req_intervals, slot_min))
             cover_sizes: List[Tuple[int, int, str]] = []
             for emp, slots in emp_slots.items():
                 coverage = len(slots & need)
@@ -262,11 +303,11 @@ def run_try_shift(
             seeds: List[List[str]] = [[]]
             for _, _, emp in cover_sizes[:max_seeds]:
                 seeds.append([emp])
-            log("DEBUG", "try-shift", f"gen-cands tag={tag} seeds={len(seeds)} k={k}")
+            log("DEBUG", "try-shift", f"gen-cands tag={tag} seeds={len(seeds)} k={k} slot={slot_min}")
             seen: set[Tuple[str, ...]] = set()
             candidates: List[Candidate] = []
             for seed in seeds:
-                picked, missing = greedy_pick(req_intervals, k, seed=seed)
+                picked, missing = greedy_pick(req_intervals, k, slot_min, seed=seed)
                 if not missing:
                     team = tuple(sorted(picked))
                     if team not in seen:
@@ -274,11 +315,15 @@ def run_try_shift(
                         total_load = sum(workload_min.get(x, 0) for x in team)
                         candidates.append(Candidate(team, len(team), total_load, tag))
             candidates.sort(key=lambda c: (c.size, c.workload_min, c.team))
-            log("INFO", "try-shift", f"gen-cands tag={tag} produced={len(candidates)}")
+            log(
+                "INFO",
+                "try-shift", f"gen-cands tag={tag} slot={slot_min} produced={len(candidates)}",
+            )
             return candidates
 
-        def compute_missing(req_intervals: List[Tuple[datetime, datetime]]) -> List[datetime]:
-            need = set(slots_union(req_intervals, SLOT_MIN))
+        def compute_missing(req_intervals: List[Tuple[datetime, datetime]], slot_min: int) -> List[datetime]:
+            emp_slots = get_emp_slots(slot_min)
+            need = set(slots_union(req_intervals, slot_min))
             possible: set[datetime] = set()
             for slots in emp_slots.values():
                 possible |= (slots & need)
@@ -290,21 +335,30 @@ def run_try_shift(
         def process_case(index: int, case: CaseReq) -> List[str]:
             lines: List[str] = []
             log("INFO", "try-shift", f"case {index}/{len(cases)}: {case.case_id}")
+            slot_min = case.slot_min or DEFAULT_SLOT_MIN
+            log("INFO", "try-shift", f"{case.case_id}: slot_min={slot_min} minutes")
             ca_week = datetime.fromisoformat((case.week_date or global_week)).date()
             req_intervals = _inflate_intervals(case.days, case.specific, ca_week)
+            if any((b - a) < timedelta(minutes=slot_min) for a, b in req_intervals):
+                log(
+                    "ERROR",
+                    "try-shift", f"{case.case_id}: requirement shorter than slot_min={slot_min}",
+                )
+                raise ValueError("requirement interval shorter than slot_min")
             day_segments = sum(len(v) for v in (case.days or {}).values())
             log(
                 "DEBUG",
                 "try-shift",
                 f"{case.case_id}: intervals={len(req_intervals)} (day_ranges={day_segments}, specific={len(case.specific)})",
             )
+
             base_k = int(case.k or DEFAULT_K)
             bump = any(len(r) > 2 for r in (case.days or {}).values())
             use_k = max(base_k, 4) if bump else base_k
             log("INFO", "try-shift", f"{case.case_id}: k={use_k} (base={base_k}, auto_bump={bump})")
 
-            baseline = generate_candidates(req_intervals, use_k, tag="baseline")
-            need_slots_baseline = set(slots_union(req_intervals, SLOT_MIN))
+            baseline = generate_candidates(req_intervals, use_k, slot_min, tag="baseline")
+            need_slots_baseline = set(slots_union(req_intervals, slot_min))
             all_candidates: List[Candidate] = list(baseline)
             forced_relax_minutes: Optional[int] = None
 
@@ -315,7 +369,10 @@ def run_try_shift(
                     forced_relax_minutes = DEFAULT_RELAX_MIN
                 relaxed_intervals = _relax_intervals(req_intervals, forced_relax_minutes)
                 relaxed_candidates = generate_candidates(
-                    relaxed_intervals, use_k, tag=f"relax+{forced_relax_minutes}m"
+                    relaxed_intervals,
+                    use_k,
+                    slot_min,
+                    tag=f"relax+{forced_relax_minutes}m",
                 )
                 seen_teams = {cand.team for cand in all_candidates}
                 added = 0
@@ -333,34 +390,48 @@ def run_try_shift(
             all_candidates.sort(key=lambda c: (c.size, c.workload_min, c.team))
             log("INFO", "try-shift", f"{case.case_id}: total candidates={len(all_candidates)}")
 
-            lines.append(f"== {case.case_id} (k<={use_k}) ==")
+            lines.append(f"== {case.case_id} (slot={slot_min}m, k<={use_k}) ==")
             if all_candidates:
                 lines.append(f"Candidates ({len(all_candidates)}):")
                 need_slots_relaxed = None
                 if forced_relax_minutes is not None:
                     need_slots_relaxed = set(
-                        slots_union(_relax_intervals(req_intervals, forced_relax_minutes), SLOT_MIN)
+                        slots_union(_relax_intervals(req_intervals, forced_relax_minutes), slot_min)
                     )
+                emp_slots_for_case = get_emp_slots(slot_min)
                 for idx, cand in enumerate(all_candidates, start=1):
                     tag_suffix = f" [{cand.tag}]" if cand.tag and cand.tag != "baseline" else ""
                     lines.append(
-                        f"  {idx}) k={cand.size} [{', '.join(cand.team)}] total_load={cand.workload_min}min{tag_suffix}"
+                        f"  {idx}) k={cand.size} slot={slot_min}m weekly_load={cand.workload_min}min{tag_suffix}"
                     )
                     need_slots_for_team = need_slots_baseline
                     if cand.tag and cand.tag != "baseline" and need_slots_relaxed is not None:
                         need_slots_for_team = need_slots_relaxed
+                    emp_entries: List[Tuple[datetime, str, List[datetime]]] = []
                     for emp in cand.team:
                         covered_slots = sorted(
-                            slot for slot in emp_slots.get(emp, set()) if slot in need_slots_for_team
+                            slot
+                            for slot in emp_slots_for_case.get(emp, set())
+                            if slot in need_slots_for_team
                         )
-                        merged = _merge_slots(covered_slots)
-                        for interval in _format_intervals(merged):
-                            lines.append(f"     - {emp}: {interval}")
+                        earliest = covered_slots[0] if covered_slots else datetime.max
+                        emp_entries.append((earliest, emp, covered_slots))
+                    remaining_slots = set(need_slots_for_team)
+                    for _, emp_name, covered_slots in sorted(emp_entries, key=lambda item: (item[0], item[1])):
+                        unique_slots = [slot for slot in covered_slots if slot in remaining_slots]
+                        if not unique_slots:
+                            continue
+                        for slot in unique_slots:
+                            remaining_slots.discard(slot)
+                        merged = _merge_slots(unique_slots, slot_min)
+                        formatted = _format_intervals(merged, slot_min)
+                        for interval in formatted:
+                            lines.append(f"     - {emp_name}: {interval}")
             else:
                 lines.append("Candidates (0): none")
 
             if not all_candidates:
-                missing_slots = compute_missing(req_intervals)
+                missing_slots = compute_missing(req_intervals, slot_min)
                 lines.append(f"Uncovered slots ({len(missing_slots)}):")
                 for slot in missing_slots[:20]:
                     lines.append("  " + slot.isoformat(timespec="minutes"))
@@ -375,14 +446,17 @@ def run_try_shift(
                 relaxed_intervals = _relax_intervals(req_intervals, relax_min)
                 log("INFO", "try-shift", f"{case.case_id}: retry with relax {relax_min}m")
                 relaxed_candidates = generate_candidates(
-                    relaxed_intervals, use_k, tag=f"relax+{relax_min}m"
+                    relaxed_intervals,
+                    use_k,
+                    slot_min,
+                    tag=f"relax+{relax_min}m",
                 )
                 lines.append(f"After relax +{relax_min}m:")
                 if relaxed_candidates:
                     lines.append(f"Candidates ({len(relaxed_candidates)}):")
                     for idx, cand in enumerate(relaxed_candidates, start=1):
                         lines.append(
-                            f"  {idx}) k={cand.size} [{', '.join(cand.team)}] total_load={cand.workload_min}min [{cand.tag}]"
+                            f"  {idx}) k={cand.size} slot={slot_min}m weekly_load={cand.workload_min}min [{cand.tag}]"
                         )
                 else:
                     lines.append("Candidates (0): none")
@@ -390,6 +464,9 @@ def run_try_shift(
                 lines.append("All requested time covered.")
             lines.append("")
             return lines
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = f"shift_candidates_{ts}.txt"
 
         results: Dict[int, List[str]] = {}
         with ThreadPoolExecutor(max_workers=min(4, len(cases))) as executor:
@@ -409,7 +486,6 @@ def run_try_shift(
         for idx in range(1, len(cases) + 1):
             out_lines.extend(results.get(idx, [f"== case-{idx} ==", "ERROR: missing result", ""]))
 
-        out_path = f"shift_candidates_{ts}.txt"
         content = "\n".join(out_lines)
         Path(out_path).write_text(content, encoding="utf-8")
         log(
