@@ -7,7 +7,7 @@ from datetime import date, timedelta
 from playwright.sync_api import Page
 from care_shift_test.utils import log
 from stack import start_stack, stop_stack
-from login import login2 as login
+from login import login
 from go_to_week_shift import go_to_week_shift
 from week_shift_import import import_week_shifts
 

@@ -1,0 +1,381 @@
+   1: # login.py
+   2: # Flow: open login -> fill account/password -> OCR 4-digit captcha -> click login.
+   3: # Returns the live Page so caller can continue with the same Chromium instance.
+   4: 
+   5: from __future__ import annotations
+   6: from pathlib import Path
+   7: from datetime import datetime
+   8: import re
+   9: from typing import Optional
+  10: 
+  11: from playwright.sync_api import Page, Locator
+  12: from care_shift_test.utils import log
+  13: from care_shift_test.ocr import read_4digit_from_png_bytes
+  14: from stack import start_stack, stop_stack
+  15: 
+  16: # --- Hard-coded site + credential for current phase ---
+  17: URL_LOGIN = "https://luna.compal-health.com/login"
+  18: ACCOUNT = "jdxb041"
+  19: PASSWORD = "Emma80625"
+  20: 
+  21: # --- Site selectors (tight and explicit) ---
+  22: ACCOUNT_SEL = "#account"
+  23: PASSWORD_SEL = "#password"
+  24: 
+  25: CASE_URL_GLOB = "**/case**"
+  26: APP_SHELL_SEL = ".MainFrame .SideBar"
+  27: SHIFT_LINK_SEL = "a.NavButton[href='/shift']"
+  28: 
+  29: # Real captcha is the 120x50 SVG next to #verificationCode
+  30: CAPTCHA_SVG_SEL = "div:has(#verificationCode) + div > svg[width='120'][height='50'][viewBox^='0,0,120,50']"
+  31: CAPTCHA_INPUT_SEL = "#verificationCode"
+  32: 
+  33: # --- Tunables / Magic numbers ---
+  34: LOGIN_MAX_ATTEMPTS = 5
+  35: CAPTCHA_VISIBLE_TIMEOUT_MS = 8000
+  36: CAPTCHA_REFRESH_WAIT_MS = 5000
+  37: CAPTCHA_RETRY_PAUSE_MS = 600
+  38: LOGIN_BUTTON_DISAPPEAR_MS = 2500
+  39: 
+  40: def _login_button_locator(page: Page) -> Locator:
+  41:     """Return a resilient locator to the real login button."""
+  42:     btn = page.get_by_test_id("loginButton").first
+  43:     if btn.count() == 0:
+  44:         btn = page.locator("button[title='登入']").first
+  45:     if btn.count() == 0:
+  46:         btn = page.get_by_role("button", name="登入").first
+  47:     return btn
+  48: 
+  49: def _locate_captcha_refresh(page: Page) -> Locator:
+  50:     """Find the captcha refresh control.
+  51: 
+  52:     Primary: the SVG icon (role=img) whose accessible name/title is '重新取得'.
+  53:     Fallbacks: title text, FontAwesome data-icon, or a similar-named button.
+  54:     """
+  55:     loc = page.get_by_role("img", name="重新取得").first
+  56:     if loc.count() > 0:
+  57:         return loc
+  58:     loc = page.locator("svg[role='img']:has(title:text-is('重新取得'))").first
+  59:     if loc.count() > 0:
+  60:         return loc
+  61:     loc = page.locator("svg[data-icon='arrows-rotate']").first
+  62:     if loc.count() > 0:
+  63:         return loc
+  64:     loc = page.get_by_role("button", name="重新取得").first
+  65:     if loc.count() > 0:
+  66:         return loc
+  67:     return page.get_by_role("button", name="重新產生").first
+  68: def _find_captcha_refresh(page: Page) -> Locator:
+  69:     """Find the captcha refresh control.
+  70: 
+  71:     Primary: the SVG icon (role=img) whose accessible name/title is '重新取得'.
+  72:     Fallbacks: SVG with matching <title>, data-icon='arrows-rotate', or button with similar name.
+  73:     """
+  74:     # SVG icon with <title>重新取得 -> exposed as role=img name=重新取得
+  75:     loc = page.get_by_role("img", name="重新取得").first
+  76:     if loc.count() > 0:
+  77:         return loc
+  78:     # CSS has() to target the SVG by its inner <title>
+  79:     loc = page.locator("svg[role='img']:has(title:text-is('重新取得'))").first
+  80:     if loc.count() > 0:
+  81:         return loc
+  82:     # FontAwesome/inline icon hint
+  83:     loc = page.locator("svg[data-icon='arrows-rotate']").first
+  84:     if loc.count() > 0:
+  85:         return loc
+  86:     # Fallbacks to buttons with similar accessible names
+  87:     loc = page.get_by_role("button", name="重新取得").first
+  88:     if loc.count() > 0:
+  89:         return loc
+  90:     loc = page.get_by_role("button", name="重新產生").first
+  91:     return loc
+  92: 
+  93: def _solve_and_fill_captcha(page: Page, dump_dir: str | None = None) -> None:
+  94:     """Wait for the real 120x50 SVG, OCR with retries, auto-refresh on failure."""
+  95:     sel = CAPTCHA_SVG_SEL
+  96:     img = page.locator(sel).first
+  97:     try:
+  98:         img.wait_for(state="visible", timeout=5000)  # ensure rendered
+  99:     except Exception:
+ 100:         log("INFO", "captcha", "captcha svg not visible"); return
+ 101: 
+ 102:     # retry up to 3 times with '重新取得'
+ 103:     for attempt in range(1, 4):
+ 104:         png = img.screenshot(type="png")
+ 105: 
+ 106:         if dump_dir:
+ 107:             Path(dump_dir).mkdir(parents=True, exist_ok=True)
+ 108:             ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+ 109:             Path(dump_dir, f"captcha_{ts}_try{attempt}.png").write_bytes(png)
+ 110: 
+ 111:         code = read_4digit_from_png_bytes(png)
+ 112:         if len(code) == 4:
+ 113:             page.locator(CAPTCHA_INPUT_SEL).fill(code)
+ 114:             log("INFO", "captcha", f"OCR ok on try {attempt}")
+ 115:             return
+ 116: 
+ 117:         # refresh and wait for svg to change
+ 118:         log("WARN", "captcha", f"OCR failed on try {attempt}, refreshing")
+ 119:         refresh = page.get_by_role("button", name="重新取得").first
+ 120:         if refresh.count() == 0:
+ 121:             # fallback: just small delay then retry
+ 122:             page.wait_for_timeout(600)
+ 123:         else:
+ 124:             old_html = img.evaluate("el => el.outerHTML")
+ 125:             refresh.click()
+ 126:             # wait until outerHTML changes (new captcha)
+ 127:             page.wait_for_function(
+ 128:                 "(selector, oldHtml) => { const el = document.querySelector(selector); return el && el.outerHTML !== oldHtml; }",
+ 129:                 (sel, old_html),
+ 130:                 timeout=5000
+ 131:             )
+ 132:             img = page.locator(sel).first  # rebind locator
+ 133: 
+ 134:     raise RuntimeError("captcha OCR failed after 3 attempts")
+ 135: 
+ 136: def _fill_captcha_once(page: Page, attempt: int, dump_dir: str | None = None) -> bool:
+ 137:     """Try a single OCR read and fill. Return True if 4-digit code was filled."""
+ 138:     sel = CAPTCHA_SVG_SEL
+ 139:     img = page.locator(sel).first
+ 140:     try:
+ 141:         img.wait_for(state="visible", timeout=CAPTCHA_VISIBLE_TIMEOUT_MS)
+ 142:     except Exception:
+ 143:         log("INFO", "captcha", "captcha svg not visible")
+ 144:         return False
+ 145: 
+ 146:     png = img.screenshot(type="png")
+ 147:     if dump_dir:
+ 148:         try:
+ 149:             Path(dump_dir).mkdir(parents=True, exist_ok=True)
+ 150:             ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+ 151:             Path(dump_dir, f"captcha_{ts}_try{attempt}.png").write_bytes(png)
+ 152:         except Exception:
+ 153:             pass
+ 154: 
+ 155:     code = read_4digit_from_png_bytes(png)
+ 156:     if len(code) == 4:
+ 157:         page.locator(CAPTCHA_INPUT_SEL).fill(code)
+ 158:         log("INFO", "captcha", f"OCR ok on try {attempt}")
+ 159:         return True
+ 160:     log("WARN", "captcha", f"OCR did not yield 4 digits on try {attempt}")
+ 161:     return False
+ 162: 
+ 163: def _did_login_succeed(page: Page, *, timeout_ms: int = 2000) -> bool:
+ 164:     """Return True if we appear to have left the login page.
+ 165: 
+ 166:     Primary check: the login button disappears. Secondary signals: app shell attached or URL changed.
+ 167:     """
+ 168:     # Prefer the explicit signal: login button detached/hidden
+ 169:     try:
+ 170:         # Wait a bit for the button to disappear after click
+ 171:         btn = _login_button_locator(page)
+ 172:         if btn.count() > 0:
+ 173:             try:
+ 174:                 btn.wait_for(state="detached", timeout=timeout_ms)
+ 175:                 return True
+ 176:             except Exception:
+ 177:                 # If still attached, check visibility
+ 178:                 try:
+ 179:                     if not btn.is_visible():
+ 180:                         return True
+ 181:                 except Exception:
+ 182:                     pass
+ 183:     except Exception:
+ 184:         # Locator resolution failed; treat as likely navigated
+ 185:         return True
+ 186: 
+ 187:     # Fallbacks: shell attached or url matches
+ 188:     try:
+ 189:         page.wait_for_selector(APP_SHELL_SEL, state="attached", timeout=800)
+ 190:         return True
+ 191:     except Exception:
+ 192:         pass
+ 193:     try:
+ 194:         page.wait_for_url(CASE_URL_GLOB, timeout=800)
+ 195:         return True
+ 196:     except Exception:
+ 197:         pass
+ 198:     return False
+ 199: 
+ 200: def _wait_until_case_loaded(page: Page) -> None:
+ 201:     """Wait until /case routed and the app shell is attached."""
+ 202:     # 先等路由，失敗也不中斷，後續用殼層選擇器保險
+ 203:     try:
+ 204:         page.wait_for_url(CASE_URL_GLOB, timeout=15000)
+ 205:     except Exception:
+ 206:         pass
+ 207:     # 等主框架與側欄出現在 DOM（不要求可見，避免被 modal 蓋住）
+ 208:     page.wait_for_selector(APP_SHELL_SEL, state="attached", timeout=8000)
+ 209:     page.wait_for_selector(SHIFT_LINK_SEL, state="attached", timeout=8000)
+ 210: 
+ 211: def _click_login(page: Page) -> None:
+ 212:     """Click the real login button."""
+ 213:     btn = page.get_by_test_id("loginButton").first
+ 214:     if btn.count() == 0:
+ 215:         btn = page.locator("button[title='登入']").first
+ 216:     if btn.count() == 0:
+ 217:         btn = page.get_by_role("button", name="登入").first
+ 218:     if btn.count() == 0:
+ 219:         raise RuntimeError("login button not found")
+ 220:     btn.scroll_into_view_if_needed()
+ 221:     btn.click()
+ 222: 
+ 223: def login2(page: Page, dump_captcha_dir: str | None = None, *, max_attempts: int = 5) -> Page:
+ 224:     """Login using OCR and refresh via the '重新取得' SVG icon; verify by login button disappearance.
+ 225: 
+ 226:     Retries up to max_attempts.
+ 227:     """
+ 228:     log("INFO", "login", f"open {URL_LOGIN}")
+ 229:     page.goto(URL_LOGIN, wait_until="domcontentloaded")
+ 230:     page.fill(ACCOUNT_SEL, ACCOUNT)
+ 231:     page.fill(PASSWORD_SEL, PASSWORD)
+ 232: 
+ 233:     # Prepare captcha elements
+ 234:     sel = CAPTCHA_SVG_SEL
+ 235:     img = page.locator(sel).first
+ 236:     try:
+ 237:         img.wait_for(state="visible", timeout=8000)
+ 238:     except Exception:
+ 239:         log("WARN", "captcha", "captcha svg not visible; proceeding anyway")
+ 240: 
+ 241:     last_html: Optional[str] = None
+ 242:     if img.count() > 0:
+ 243:         try:
+ 244:             last_html = img.evaluate("el => el.outerHTML")
+ 245:         except Exception:
+ 246:             last_html = None
+ 247: 
+ 248:     for attempt in range(1, max_attempts + 1):
+ 249:         # On retries, click the '重新取得' refresh icon and wait for change
+ 250:         if attempt > 1:
+ 251:             try:
+ 252:                 refresh = _locate_captcha_refresh(page)
+ 253:                 if refresh.count() > 0:
+ 254:                     prev = last_html or (img.evaluate("el => el.outerHTML") if img.count() > 0 else "")
+ 255:                     try:
+ 256:                         refresh.scroll_into_view_if_needed()
+ 257:                     except Exception:
+ 258:                         pass
+ 259:                     try:
+ 260:                         refresh.click()
+ 261:                     except Exception:
+ 262:                         try:
+ 263:                             refresh.locator("xpath=ancestor-or-self::button[1]").click()
+ 264:                         except Exception:
+ 265:                             pass
+ 266:                     page.wait_for_function(
+ 267:                         "(selector, oldHtml) => { const el = document.querySelector(selector); return el && el.outerHTML !== oldHtml; }",
+ 268:                         (sel, prev),
+ 269:                         timeout=5000,
+ 270:                     )
+ 271:                     img = page.locator(sel).first
+ 272:                     try:
+ 273:                         last_html = img.evaluate("el => el.outerHTML")
+ 274:                     except Exception:
+ 275:                         last_html = None
+ 276:                 else:
+ 277:                     page.wait_for_timeout(600)
+ 278:             except Exception:
+ 279:                 page.wait_for_timeout(600)
+ 280: 
+ 281:         # Try a single OCR read + fill
+ 282:         if not _fill_captcha_once(page, attempt, dump_dir=dump_captcha_dir):
+ 283:             continue
+ 284: 
+ 285:         # Click login and check success by button disappearance
+ 286:         _click_login(page)
+ 287:         if _did_login_succeed(page, timeout_ms=2500):
+ 288:             try:
+ 289:                 _wait_until_case_loaded(page)
+ 290:             except Exception:
+ 291:                 _wait_until_case_loaded(page)
+ 292:             log("INFO", "login", f"success on attempt {attempt}, url={page.url!r}")
+ 293:             log("INFO", "login", f"title={page.title()!r}")
+ 294:             return page
+ 295:         else:
+ 296:             log("WARN", "login", f"attempt {attempt} failed; retrying")
+ 297: 
+ 298:     raise RuntimeError(f"login failed after {max_attempts} attempts")
+ 299: 
+ 300: def login(page: Page, dump_captcha_dir: str | None = None, *, max_attempts: int = 5) -> Page:
+ 301:     """Perform login with OCR captcha and verify success by login button disappearance.
+ 302: 
+ 303:     Retries up to max_attempts:
+ 304:       - OCR captcha once and fill
+ 305:       - Click login
+ 306:       - If login button still present (or no shell), refresh captcha and retry
+ 307:     """
+ 308:     log("INFO", "login", f"open {URL_LOGIN}")
+ 309:     page.goto(URL_LOGIN, wait_until="domcontentloaded")
+ 310:     page.fill(ACCOUNT_SEL, ACCOUNT)
+ 311:     page.fill(PASSWORD_SEL, PASSWORD)
+ 312: 
+ 313:     # Prepare captcha elements
+ 314:     sel = CAPTCHA_SVG_SEL
+ 315:     img = page.locator(sel).first
+ 316:     try:
+ 317:         img.wait_for(state="visible", timeout=8000)
+ 318:     except Exception:
+ 319:         log("WARN", "captcha", "captcha svg not visible; proceeding anyway")
+ 320: 
+ 321:     last_html: Optional[str] = None
+ 322:     if img.count() > 0:
+ 323:         try:
+ 324:             last_html = img.evaluate("el => el.outerHTML")
+ 325:         except Exception:
+ 326:             last_html = None
+ 327: 
+ 328:     for attempt in range(1, max_attempts + 1):
+ 329:         # On retries, refresh captcha and wait for change
+ 330:         if attempt > 1:
+ 331:             try:
+ 332:                 refresh = page.get_by_role("button", name="重新產生").first
+ 333:             except Exception:
+ 334:                 refresh = page.get_by_role("button", name="���s���o").first  # encoding fallback
+ 335:             try:
+ 336:                 if refresh.count() > 0:
+ 337:                     prev = last_html or (img.evaluate("el => el.outerHTML") if img.count() > 0 else "")
+ 338:                     refresh.click()
+ 339:                     page.wait_for_function(
+ 340:                         "(selector, oldHtml) => { const el = document.querySelector(selector); return el && el.outerHTML !== oldHtml; }",
+ 341:                         (sel, prev),
+ 342:                         timeout=5000,
+ 343:                     )
+ 344:                     img = page.locator(sel).first
+ 345:                     try:
+ 346:                         last_html = img.evaluate("el => el.outerHTML")
+ 347:                     except Exception:
+ 348:                         last_html = None
+ 349:                 else:
+ 350:                     page.wait_for_timeout(600)
+ 351:             except Exception:
+ 352:                 page.wait_for_timeout(600)
+ 353: 
+ 354:         # Try a single OCR read + fill
+ 355:         if not _fill_captcha_once(page, attempt, dump_dir=dump_captcha_dir):
+ 356:             continue
+ 357: 
+ 358:         # Click login and check success by button disappearance
+ 359:         _click_login(page)
+ 360:         if _did_login_succeed(page, timeout_ms=2500):
+ 361:             try:
+ 362:                 _wait_until_case_loaded(page)
+ 363:             except Exception:
+ 364:                 _wait_until_case_loaded(page)
+ 365:             log("INFO", "login", f"success on attempt {attempt}, url={page.url!r}")
+ 366:             log("INFO", "login", f"title={page.title()!r}")
+ 367:             return page
+ 368:         else:
+ 369:             log("WARN", "login", f"attempt {attempt} failed; retrying")
+ 370: 
+ 371:     raise RuntimeError(f"login failed after {max_attempts} attempts")
+ 372: 
+ 373: if __name__ == "__main__":
+ 374:     # Standalone test: starts one Chromium, logs in, then waits for manual close.
+ 375:     pw, br, ctx, page = start_stack()
+ 376:     try:
+ 377:         login(page)  # returns same page
+ 378:         log("INFO", "login", "logged in; press Enter to exit")
+ 379:         input()
+ 380:     finally:
+ 381:         stop_stack(pw, br, ctx)

@@ -5,7 +5,6 @@
 from __future__ import annotations
 from pathlib import Path
 from datetime import datetime
-import re
 from typing import Optional
 
 from playwright.sync_api import Page, Locator
@@ -30,6 +29,13 @@ SHIFT_LINK_SEL = "a.NavButton[href='/shift']"
 CAPTCHA_SVG_SEL = "div:has(#verificationCode) + div > svg[width='120'][height='50'][viewBox^='0,0,120,50']"
 CAPTCHA_INPUT_SEL = "#verificationCode"
 
+# --- Tunables / Magic numbers ---
+LOGIN_MAX_ATTEMPTS = 5
+CAPTCHA_VISIBLE_TIMEOUT_MS = 8000
+CAPTCHA_REFRESH_WAIT_MS = 5000
+CAPTCHA_RETRY_PAUSE_MS = 600
+LOGIN_BUTTON_DISAPPEAR_MS = 2500
+
 def _login_button_locator(page: Page) -> Locator:
     """Return a resilient locator to the real login button."""
     btn = page.get_by_test_id("loginButton").first
@@ -39,7 +45,26 @@ def _login_button_locator(page: Page) -> Locator:
         btn = page.get_by_role("button", name="登入").first
     return btn
 
-def _find_captcha_refresh(page: Page) -> Locator:
+def _locate_captcha_refresh(page: Page) -> Locator:
+    """Find the captcha refresh control.
+
+    Primary: the SVG icon (role=img) whose accessible name/title is '重新取得'.
+    Fallbacks: title text, FontAwesome data-icon, or a similar-named button.
+    """
+    loc = page.get_by_role("img", name="重新取得").first
+    if loc.count() > 0:
+        return loc
+    loc = page.locator("svg[role='img']:has(title:text-is('重新取得'))").first
+    if loc.count() > 0:
+        return loc
+    loc = page.locator("svg[data-icon='arrows-rotate']").first
+    if loc.count() > 0:
+        return loc
+    loc = page.get_by_role("button", name="重新取得").first
+    if loc.count() > 0:
+        return loc
+    return page.get_by_role("button", name="重新產生").first
+def _UNUSED_find_captcha_refresh(page: Page) -> Locator:
     """Find the captcha refresh control.
 
     Primary: the SVG icon (role=img) whose accessible name/title is '重新取得'.
@@ -64,7 +89,7 @@ def _find_captcha_refresh(page: Page) -> Locator:
     loc = page.get_by_role("button", name="重新產生").first
     return loc
 
-def _solve_and_fill_captcha(page: Page, dump_dir: str | None = None) -> None:
+def _UNUSED_solve_and_fill_captcha(page: Page, dump_dir: str | None = None) -> None:
     """Wait for the real 120x50 SVG, OCR with retries, auto-refresh on failure."""
     sel = CAPTCHA_SVG_SEL
     img = page.locator(sel).first
@@ -112,7 +137,7 @@ def _fill_captcha_once(page: Page, attempt: int, dump_dir: str | None = None) ->
     sel = CAPTCHA_SVG_SEL
     img = page.locator(sel).first
     try:
-        img.wait_for(state="visible", timeout=5000)
+        img.wait_for(state="visible", timeout=CAPTCHA_VISIBLE_TIMEOUT_MS)
     except Exception:
         log("INFO", "captcha", "captcha svg not visible")
         return False
@@ -127,19 +152,14 @@ def _fill_captcha_once(page: Page, attempt: int, dump_dir: str | None = None) ->
             pass
 
     code = read_4digit_from_png_bytes(png)
-    
-    # TO
-    print(f"verification code is: {code}")
-    
     if len(code) == 4:
         page.locator(CAPTCHA_INPUT_SEL).fill(code)
         log("INFO", "captcha", f"OCR ok on try {attempt}")
         return True
-    else:
-        log("WARN", "captcha", f"OCR did not yield 4 digits on try {attempt}")
-        return False
+    log("WARN", "captcha", f"OCR did not yield 4 digits on try {attempt}")
+    return False
 
-def _did_login_succeed(page: Page, *, timeout_ms: int = 2000) -> bool:
+def _did_login_succeed(page: Page, *, timeout_ms: int = LOGIN_BUTTON_DISAPPEAR_MS) -> bool:
     """Return True if we appear to have left the login page.
 
     Primary check: the login button disappears. Secondary signals: app shell attached or URL changed.
@@ -199,7 +219,7 @@ def _click_login(page: Page) -> None:
     btn.scroll_into_view_if_needed()
     btn.click()
 
-def login2(page: Page, dump_captcha_dir: str | None = None, *, max_attempts: int = 5) -> Page:
+def login(page: Page, dump_captcha_dir: str | None = None, *, max_attempts: int = LOGIN_MAX_ATTEMPTS) -> Page:
     """Login using OCR and refresh via the '重新取得' SVG icon; verify by login button disappearance.
 
     Retries up to max_attempts.
@@ -213,7 +233,7 @@ def login2(page: Page, dump_captcha_dir: str | None = None, *, max_attempts: int
     sel = CAPTCHA_SVG_SEL
     img = page.locator(sel).first
     try:
-        img.wait_for(state="visible", timeout=8000)
+        img.wait_for(state="visible", timeout=CAPTCHA_VISIBLE_TIMEOUT_MS)
     except Exception:
         log("WARN", "captcha", "captcha svg not visible; proceeding anyway")
 
@@ -228,7 +248,7 @@ def login2(page: Page, dump_captcha_dir: str | None = None, *, max_attempts: int
         # On retries, click the '重新取得' refresh icon and wait for change
         if attempt > 1:
             try:
-                refresh = _find_captcha_refresh(page)
+                refresh = _locate_captcha_refresh(page)
                 if refresh.count() > 0:
                     prev = last_html or (img.evaluate("el => el.outerHTML") if img.count() > 0 else "")
                     try:
@@ -245,7 +265,7 @@ def login2(page: Page, dump_captcha_dir: str | None = None, *, max_attempts: int
                     page.wait_for_function(
                         "(selector, oldHtml) => { const el = document.querySelector(selector); return el && el.outerHTML !== oldHtml; }",
                         (sel, prev),
-                        timeout=5000,
+                        timeout=CAPTCHA_REFRESH_WAIT_MS,
                     )
                     img = page.locator(sel).first
                     try:
@@ -253,9 +273,9 @@ def login2(page: Page, dump_captcha_dir: str | None = None, *, max_attempts: int
                     except Exception:
                         last_html = None
                 else:
-                    page.wait_for_timeout(600)
+                    page.wait_for_timeout(CAPTCHA_RETRY_PAUSE_MS)
             except Exception:
-                page.wait_for_timeout(600)
+                page.wait_for_timeout(CAPTCHA_RETRY_PAUSE_MS)
 
         # Try a single OCR read + fill
         if not _fill_captcha_once(page, attempt, dump_dir=dump_captcha_dir):
@@ -263,7 +283,7 @@ def login2(page: Page, dump_captcha_dir: str | None = None, *, max_attempts: int
 
         # Click login and check success by button disappearance
         _click_login(page)
-        if _did_login_succeed(page, timeout_ms=2500):
+        if _did_login_succeed(page, timeout_ms=LOGIN_BUTTON_DISAPPEAR_MS):
             try:
                 _wait_until_case_loaded(page)
             except Exception:
@@ -276,7 +296,7 @@ def login2(page: Page, dump_captcha_dir: str | None = None, *, max_attempts: int
 
     raise RuntimeError(f"login failed after {max_attempts} attempts")
 
-def login(page: Page, dump_captcha_dir: str | None = None, *, max_attempts: int = 5) -> Page:
+def login_legacy(page: Page, dump_captcha_dir: str | None = None, *, max_attempts: int = 5) -> Page:
     """Perform login with OCR captcha and verify success by login button disappearance.
 
     Retries up to max_attempts:

@@ -177,3 +177,4 @@ def go_to_week_shift(page: Page, *, dont_show_again: bool = True) -> Page:
             continue
 
     raise TimeoutError("navigate to /shift timed out")
+

@@ -1,0 +1,45 @@
+  90:     return loc
+  91: 
+  92: def _solve_and_fill_captcha(page: Page, dump_dir: str | None = None) -> None:
+  93:     """Wait for the real 120x50 SVG, OCR with retries, auto-refresh on failure."""
+  94:     sel = CAPTCHA_SVG_SEL
+  95:     img = page.locator(sel).first
+  96:     try:
+  97:         img.wait_for(state="visible", timeout=5000)  # ensure rendered
+  98:     except Exception:
+  99:         log("INFO", "captcha", "captcha svg not visible"); return
+ 100: 
+ 101:     # retry up to 3 times with '重新取得'
+ 102:     for attempt in range(1, 4):
+ 103:         png = img.screenshot(type="png")
+ 104: 
+ 105:         if dump_dir:
+ 106:             Path(dump_dir).mkdir(parents=True, exist_ok=True)
+ 107:             ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+ 108:             Path(dump_dir, f"captcha_{ts}_try{attempt}.png").write_bytes(png)
+ 109: 
+ 110:         code = read_4digit_from_png_bytes(png)
+ 111:         if len(code) == 4:
+ 112:             page.locator(CAPTCHA_INPUT_SEL).fill(code)
+ 113:             log("INFO", "captcha", f"OCR ok on try {attempt}")
+ 114:             return
+ 115: 
+ 116:         # refresh and wait for svg to change
+ 117:         log("WARN", "captcha", f"OCR failed on try {attempt}, refreshing")
+ 118:         refresh = page.get_by_role("button", name="重新取得").first
+ 119:         if refresh.count() == 0:
+ 120:             # fallback: just small delay then retry
+ 121:             page.wait_for_timeout(600)
+ 122:         else:
+ 123:             old_html = img.evaluate("el => el.outerHTML")
+ 124:             refresh.click()
+ 125:             # wait until outerHTML changes (new captcha)
+ 126:             page.wait_for_function(
+ 127:                 "(selector, oldHtml) => { const el = document.querySelector(selector); return el && el.outerHTML !== oldHtml; }",
+ 128:                 (sel, old_html),
+ 129:                 timeout=5000
+ 130:             )
+ 131:             img = page.locator(sel).first  # rebind locator
+ 132: 
+ 133:     raise RuntimeError("captcha OCR failed after 3 attempts")
+ 134: 

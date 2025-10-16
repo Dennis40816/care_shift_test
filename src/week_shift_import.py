@@ -1,12 +1,24 @@
 # week_shift_import.py
 from __future__ import annotations
-import sqlite3, json, re
-from datetime import date, datetime, timedelta
+import sqlite3, json
+from datetime import date, timedelta, datetime
 from typing import Any, Dict, List, Optional
 from playwright.sync_api import Page
 
 from care_shift_test.utils import log
+
 import time
+
+# --- Tunables & selectors (centralized magic numbers) ---
+PAGE_SIZE_DEFAULT = 100
+PAGE_TIMEOUT_MS_DEFAULT = 12000
+PAGE_STABLE_MS_DEFAULT = 5000
+POLL_MS_DEFAULT = 200
+
+PAGE_DROPDOWN_SEL = "#pageDropDown"
+ROWS_SEL = "tbody .user-col"
+MENU_VISIBLE_TIMEOUT_MS = 2000
+MENU_HIDE_WAIT_MS = 3000
 
 # ---------- DOM → raw rows ----------
 
@@ -61,6 +73,7 @@ _JS_EXTRACT = r"""
 """
 
 def _hhmm_to_min(s: str) -> int:
+    """Convert 'HH:MM' to minutes since 00:00."""
     h, m = s.split(":")
     return int(h) * 60 + int(m)
 
@@ -80,7 +93,7 @@ def _infer_status_flag(body_flags: List[str], statuses: List[Dict[str, str]]) ->
     return "normal" if texts else None
 
 def extract_week_raw(page: Page) -> List[Dict[str, Any]]:
-    """Read DOM and return raw card rows with day_index and time strings."""
+    """Read the DOM and return raw card rows with day_index and time strings."""
     return page.evaluate(_JS_EXTRACT)
 
 # ---------- DB schema ----------
@@ -134,6 +147,7 @@ def _first_neutral_status(statuses: List[Dict[str, str]]) -> Optional[str]:
     return None
 
 def normalize_rows(raw: List[Dict[str, Any]], week_start: date) -> List[Dict[str, Any]]:
+    """Normalize raw DOM rows into DB-ready dicts with computed dates/minutes."""
     out: List[Dict[str, Any]] = []
     for r in raw:
         if not r.get("start") or not r.get("end"):
@@ -164,7 +178,8 @@ def normalize_rows(raw: List[Dict[str, Any]], week_start: date) -> List[Dict[str
     return out
 
 def upsert_employees(conn: sqlite3.Connection, rows: List[Dict[str, Any]]) -> None:
-    to_upsert = {(r["employee_id"], r["employee_name"]) for r in rows if r.get("employee_id")}
+    """Upsert unique employees into the employees table."""
+    to_upsert = {(r.get("employee_id"), r.get("employee_name")) for r in rows if r.get("employee_id")}
     if not to_upsert:
         return
     conn.executemany(
@@ -174,6 +189,7 @@ def upsert_employees(conn: sqlite3.Connection, rows: List[Dict[str, Any]]) -> No
     )
 
 def upsert_shifts(conn: sqlite3.Connection, rows: List[Dict[str, Any]]) -> int:
+    """Upsert all shift rows; returns affected row count."""
     cur = conn.executemany(
         """
         INSERT INTO shifts
@@ -195,15 +211,17 @@ def upsert_shifts(conn: sqlite3.Connection, rows: List[Dict[str, Any]]) -> int:
     )
     return cur.rowcount or 0
 
-def set_people_page_size(page: Page, size: int = 100,
-                         timeout_ms: int = 12000,
-                         stable_ms: int = 5000,
-                         poll_ms: int = 200) -> int:
-    btn = page.locator("#pageDropDown").first
+def set_people_page_size(page: Page,
+                         size: int = PAGE_SIZE_DEFAULT,
+                         timeout_ms: int = PAGE_TIMEOUT_MS_DEFAULT,
+                         stable_ms: int = PAGE_STABLE_MS_DEFAULT,
+                         poll_ms: int = POLL_MS_DEFAULT) -> int:
+    """Set people table page size and wait until the row count stabilizes."""
+    btn = page.locator(PAGE_DROPDOWN_SEL).first
     btn.wait_for(state="visible", timeout=timeout_ms)
     btn.scroll_into_view_if_needed()
 
-    rows = page.locator("tbody .user-col")
+    rows = page.locator(ROWS_SEL)
     try:
         prev = rows.count()
     except Exception:
@@ -216,7 +234,7 @@ def set_people_page_size(page: Page, size: int = 100,
         "#pageDropDown ~ .dropdown-menu, "
         ".open .dropdown-menu"
     ).first
-    menu.wait_for(state="visible", timeout=2000)
+    menu.wait_for(state="visible", timeout=MENU_VISIBLE_TIMEOUT_MS)
 
     item = menu.locator(f"[role='menuitem'][data-page='{size}']").first
     if item.count() == 0:
@@ -238,7 +256,7 @@ def set_people_page_size(page: Page, size: int = 100,
           return !(menu && menu.offsetParent);
         }
         """,
-        timeout=min(3000, timeout_ms)
+        timeout=min(MENU_HIDE_WAIT_MS, timeout_ms)
     )
 
     # Phase 2：列數連續穩定 stable_ms，含倒計時日誌
@@ -287,7 +305,7 @@ def set_people_page_size(page: Page, size: int = 100,
 def import_week_shifts(page: Page, db_path: str, week_start: str | date) -> int:
     """High-level: DOM→rows→DB. week_start is this view's Sunday date."""
     # show 100 employee first
-    set_people_page_size(page, 100)
+    set_people_page_size(page, PAGE_SIZE_DEFAULT)
     
     ws = _coerce_week_start(week_start)
     raw = extract_week_raw(page)
@@ -324,3 +342,4 @@ if __name__ == "__main__":
     # count = import_week_shifts(page, "shifts.db", "2025-01-12")  # week Sunday
     # print("upserted rows:", count)
     pass
+
