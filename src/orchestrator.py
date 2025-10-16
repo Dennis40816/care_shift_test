@@ -10,6 +10,7 @@ from stack import start_stack, stop_stack
 from login import login
 from go_to_week_shift import go_to_week_shift
 from week_shift_import import import_week_shifts
+from try_shift import run_try_shift
 
 def ensure_page(ctx, page: Page) -> Page:
     """Ensure a live page exists; recreate if closed."""
@@ -62,19 +63,33 @@ def stage_all(page: Page) -> Page:
 def main() -> None:
     pw, br, ctx, page = start_stack(headless=False)
     try:
+        def stage_try_shift(page: Page) -> Page:
+            try:
+                path = run_try_shift()
+                if path:
+                    log("INFO", "try-shift", f"written -> {path}")
+                else:
+                    log("WARN", "try-shift", "no output file produced")
+            except Exception as e:
+                log("ERROR", "try-shift", f"failed: {e}")
+                raise
+            return page
+
         actions: dict[str, tuple[str, Callable[[Page], Page]]] = {
             "1": ("all", stage_all),
             "2": ("login", stage_login),
             "3": ("go_to_week_shift", stage_shift),
             "4": ("import_week_to_db", stage_import),
+            "5": ("try_shift", stage_try_shift),
         }
 
         while True:
             print("\nSelect stage:")
-            print("  [1] all  (login -> go_to_week_shift -> import_week_to_db)")
+            print("  [1] all  (login -> go_to_week_shift -> import_week_to_db -> try_shift)")
             print("  [2] login")
             print("  [3] go_to_week_shift")
             print("  [4] import_week_to_db")
+            print("  [5] try_shift")
             print("  [q] quit")
             choice = input("Choice: ").strip().lower()
 

@@ -1,0 +1,16 @@
+{
+  "week_date": null,
+  "cases": [
+    {
+      "case_id": "Test Only",
+      "k": 3,
+      "days": {
+        "mon": ["16:00-18:00"],
+        "tue": ["09:30-10:00", "14:00-17:30"]
+      },
+      "specific": [],
+      "backup_strategy": {}
+    }
+  ]
+}
+

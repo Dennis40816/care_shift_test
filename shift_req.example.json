@@ -1,0 +1,43 @@
+{
+  "notes": "Example shift_req.json showcasing all currently supported features. Comments are provided via 'notes' fields to remain valid JSON.",
+  "week_date": null,
+  "cases": [
+    {
+      "case_id": "Baseline-Only",
+      "notes": "Basic case using current week (week_date=null). Uses k=3 and days mapping only; no backup_strategy.",
+      "k": 3,
+      "days": {
+        "mon": ["09:00-11:00"],
+        "tue": ["13:00-15:00"],
+        "fri": ["10:30-12:00"]
+      },
+      "specific": [],
+      "backup_strategy": null
+    },
+    {
+      "case_id": "Week-Override-And-Specific",
+      "notes": "Overrides the target week using case-level week_date. Adds a specific date with custom ranges. Also enables forced relax backup_strategy to enumerate more candidates.",
+      "week_date": "2025-10-15",
+      "k": 2,
+      "days": {
+        "mon": ["09:00-12:00"],
+        "thu": ["14:00-16:00"]
+      },
+      "specific": [
+        { "date": "2025-10-17", "ranges": ["16:00-18:00"] }
+      ],
+      "backup_strategy": { "type": "relax_minutes", "minutes": 15 }
+    },
+    {
+      "case_id": "Auto-K-Bump-Demo",
+      "notes": "Any day with more than two ranges will auto-bump allowed k to 4 internally. This demonstrates the special-case policy.",
+      "k": 3,
+      "days": {
+        "wed": ["08:00-09:00", "11:00-12:00", "15:00-16:00"]
+      },
+      "specific": [],
+      "backup_strategy": { "type": "relax_minutes", "minutes": 30 }
+    }
+  ]
+}
+
