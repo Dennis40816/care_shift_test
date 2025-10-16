@@ -53,27 +53,30 @@ def stage_import(page: Page) -> Page:
         raise
     return page
 
+def stage_try_shift(page: Page) -> Page:
+    try:
+        path = run_try_shift()
+        if path:
+            log("INFO", "try-shift", f"written -> {path}")
+        else:
+            log("WARN", "try-shift", "no output file produced")
+    except Exception as e:
+        log("ERROR", "try-shift", f"failed: {e}")
+        raise
+    return page
+
 def stage_all(page: Page) -> Page:
     """Login -> Week shift -> Import DB."""
     page = stage_login(page)
     page = stage_shift(page)
     page = stage_import(page)
+    page = stage_try_shift(page)
     return page
 
 def main() -> None:
     pw, br, ctx, page = start_stack(headless=False)
     try:
-        def stage_try_shift(page: Page) -> Page:
-            try:
-                path = run_try_shift()
-                if path:
-                    log("INFO", "try-shift", f"written -> {path}")
-                else:
-                    log("WARN", "try-shift", "no output file produced")
-            except Exception as e:
-                log("ERROR", "try-shift", f"failed: {e}")
-                raise
-            return page
+
 
         actions: dict[str, tuple[str, Callable[[Page], Page]]] = {
             "1": ("all", stage_all),

@@ -77,6 +77,22 @@ Each coverage line lists the employee and merged time blocks, e.g. `- 陳怡婷:
 - Update Playwright: `.".venv\Scripts\python.exe" -m playwright install`
 - Run orchestrator without script: `.".venv\Scripts\python.exe" src\orchestrator.py`
 
-### 6. Support
+### 6. Build Standalone Package (PyInstaller)
+
+1. Ensure dependencies are installed (`install_dependencies.ps1`) and browsers downloaded.
+2. Execute:
+
+   ```powershell
+   ./build_exe.ps1 -Clean
+   ```
+
+3. Result is under `dist/care_shift/`:
+   - `care_shift.exe`
+   - `ms-playwright/` (bundled Chromium)
+   - `run_care_shift.cmd` (sets `PLAYWRIGHT_BROWSERS_PATH` then launches exe)
+
+Copy the whole folder to the target machine and run `run_care_shift.cmd` to launch without installing Python.
+
+### 7. Support
 
 If anything fails, re-run the installer and review logs in `shift_candidates_*.txt` or the console. The `TODO.md` file tracks roadmap items for future enhancements.
