@@ -3,7 +3,7 @@ from PyInstaller.utils.hooks import collect_all
 
 datas = [('shift_req.json', '.'), ('shift_req.example.json', '.'), ('README.md', '.')]
 binaries = []
-hiddenimports = ['care_shift_test.ocr', 'care_shift_test.utils', 'try_shift_core']
+hiddenimports = ['care_shift_test.ocr', 'care_shift_test.utils', 'try_shift_engine']
 tmp_ret = collect_all('playwright')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 

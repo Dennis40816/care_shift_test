@@ -40,7 +40,7 @@ $pyinstallerArgs = @(
     "--collect-all", "playwright",
     "--hidden-import", "care_shift_test.ocr",
     "--hidden-import", "care_shift_test.utils",
-    "--hidden-import", "try_shift_core",
+    "--hidden-import", "try_shift_engine",
     "--add-data", "shift_req.json;.",
     "--add-data", "shift_req.example.json;.",
     "--add-data", "README.md;."
