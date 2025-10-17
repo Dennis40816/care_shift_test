@@ -1,10 +1,10 @@
 {
-  "notes": "Example shift_req.json showcasing all currently supported features. Comments are provided via 'notes' fields to remain valid JSON.",
+  "notes": "Example shift_req.json showcasing all supported fields. Use 'notes' strings for guidance (keeps JSON valid). Day keys are: sun, mon, tue, wed, thu, fri, sat.",
   "week_date": null,
   "cases": [
     {
       "case_id": "Baseline-Only",
-      "notes": "Basic case using current week (week_date=null). Uses k=3 and days mapping only; no backup_strategy.",
+      "notes": "Basic case using current week (week_date = null). Uses k=3 and only 'days'; no backup.",
       "k": 3,
       "slot_min": 30,
       "days": {
@@ -17,7 +17,7 @@
     },
     {
       "case_id": "Week-Override-And-Specific",
-      "notes": "Overrides the target week using case-level week_date. Adds a specific date with custom ranges. Also enables forced relax backup_strategy to enumerate more candidates.",
+      "notes": "Override week by case-level week_date and add a specific date. Also show relax backup_strategy.",
       "week_date": "2025-10-15",
       "k": 2,
       "slot_min": 45,
@@ -32,7 +32,7 @@
     },
     {
       "case_id": "Auto-K-Bump-Demo",
-      "notes": "Any day with more than two ranges will auto-bump allowed k to 4 internally. This demonstrates the special-case policy.",
+      "notes": "If any day has more than two ranges, internal allowed k auto-bumps to 4.",
       "k": 3,
       "slot_min": 30,
       "days": {
@@ -40,6 +40,29 @@
       },
       "specific": [],
       "backup_strategy": { "type": "relax_minutes", "minutes": 30 }
+    },
+    {
+      "case_id": "Full-Options",
+      "notes": "Show all optional fields filled, and all weekday keys. enumerate_all lists all covering combinations; include_supersets controls whether to also list non-minimal supersets.",
+      "week_date": "2025-10-13",
+      "k": 3,
+      "slot_min": 30,
+      "days": {
+        "sun": ["08:30-09:30"],
+        "mon": ["16:00-18:00"],
+        "tue": ["09:30-10:00", "14:00-17:30"],
+        "wed": ["15:00-17:00"],
+        "thu": ["09:00-10:00"],
+        "fri": ["10:00-12:00"],
+        "sat": ["13:00-14:30"]
+      },
+      "specific": [
+        { "date": "2025-10-16", "ranges": ["18:00-20:00"] }
+      ],
+      "backup_strategy": { "type": "relax_minutes", "minutes": 30 },
+      "enumerate_all": true,
+      "max_team_size": 3,
+      "include_supersets": false
     }
   ]
 }

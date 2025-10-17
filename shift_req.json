@@ -6,11 +6,21 @@
       "k": 3,
       "slot_min": 30,
       "days": {
-        "mon": ["16:00-18:00"],
-        "tue": ["09:30-10:00", "14:00-17:30"]
+        "mon": [
+          "16:00-18:00"
+        ],
+        "tue": [
+          "09:30-10:00",
+          "14:00-17:30"
+        ],
+        "wed": [
+          "15:00-17:00"
+        ]
       },
       "specific": [],
-      "backup_strategy": {}
+      "backup_strategy": {},
+      "enumerate_all": true,
+      "max_team_size": null
     }
   ]
 }

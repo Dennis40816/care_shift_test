@@ -16,7 +16,9 @@ DEFAULT_K = 3
 DEFAULT_RELAX_MIN = 30
 DEFAULT_SLOT_MIN = SLOT_MIN
 
-DAY_LABELS = ["日", "一", "二", "三", "四", "五", "六"]
+# Python's date.weekday(): Monday=0 .. Sunday=6
+# Keep labels in the same order to avoid off-by-one weekday names.
+DAY_LABELS = ["一", "二", "三", "四", "五", "六", "日"]
 
 
 @dataclass
@@ -28,6 +30,10 @@ class CaseReq:
     k: Optional[int]
     backup_strategy: Optional[Dict[str, Any]] = None
     slot_min: Optional[int] = None
+    # Optional enumeration controls
+    enumerate_all: Optional[bool] = None  # list all covering teams
+    max_team_size: Optional[int] = None   # cap team size when enumerating
+    include_supersets: Optional[bool] = None  # if True, also include non-minimal supersets
 
 
 @dataclass(frozen=True)
@@ -48,6 +54,12 @@ class RunContext:
     _slot_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def get_emp_slots(self, slot_min: int) -> Dict[str, set[datetime]]:
+        """Return employees' BUSY slots for the week, discretized.
+
+        DB intervals represent scheduled shifts (busy/unavailable). We cache
+        these per `slot_min`. Availability is derived later as
+        (need_slots - busy_slots_for_emp).
+        """
         with self._slot_lock:
             cache = self._slot_cache.get(slot_min)
             if cache is None:
@@ -60,11 +72,17 @@ class RunContext:
         return cache
 
     def compute_missing(self, req_intervals: List[Tuple[datetime, datetime]], slot_min: int) -> List[datetime]:
+        """Need slots that no employee is free to take.
+
+        For each employee, free slots relative to the requirement are
+        (need - busy). We union those across employees to find what is
+        coverable, then subtract from need.
+        """
         need = set(slots_union(req_intervals, slot_min))
-        emp_slots = self.get_emp_slots(slot_min)
+        emp_busy = self.get_emp_slots(slot_min)
         possible: set[datetime] = set()
-        for slots in emp_slots.values():
-            possible |= (slots & need)
+        for busy in emp_busy.values():
+            possible |= (need - busy)
         return sorted(need - possible)
 
     def close(self) -> None:
@@ -147,6 +165,39 @@ def _merge_slots(slots: Iterable[datetime], slot_min: int) -> List[Tuple[datetim
     return merged
 
 
+def _minimal_team(
+    ctx: RunContext,
+    need_slots: set[datetime],
+    slot_min: int,
+    team_list: List[str],
+) -> List[str]:
+    """Prune redundant members that don't change coverage.
+
+    If removing an employee keeps full coverage of `need_slots`, drop them.
+    Ensures we output minimal teams and avoid duplicates like
+    [A, B] when A alone already covers all need.
+    """
+    busy = ctx.get_emp_slots(slot_min)
+    team: List[str] = list(dict.fromkeys(team_list))  # preserve order, unique
+
+    def union_free(members: List[str]) -> set[datetime]:
+        u: set[datetime] = set()
+        for e in members:
+            u |= (need_slots - busy.get(e, set()))
+        return u
+
+    changed = True
+    while changed and len(team) > 1:
+        changed = False
+        for i in range(len(team)):
+            others = team[:i] + team[i + 1 :]
+            if union_free(others) >= need_slots:
+                del team[i]
+                changed = True
+                break
+    return team
+
+
 def _format_intervals(intervals: Iterable[Tuple[datetime, datetime]]) -> List[str]:
     def sort_key(interval: Tuple[datetime, datetime]) -> Tuple[int, datetime, datetime]:
         start, end = interval
@@ -192,23 +243,25 @@ def _greedy_pick(
     k: int,
     seed: Optional[List[str]] = None,
 ) -> Tuple[List[str], List[datetime]]:
-    emp_slots = ctx.get_emp_slots(slot_min)
+    emp_busy = ctx.get_emp_slots(slot_min)
     need = set(slots_union(req_intervals, slot_min))
     picked: List[str] = []
     covered: set[datetime] = set()
     if seed:
         for emp in seed:
-            if emp in emp_slots:
+            if emp in emp_busy:
                 picked.append(emp)
-                covered |= (emp_slots[emp] & need)
+                # Add this employee's free slots relative to need
+                covered |= (need - emp_busy[emp])
     while len(picked) < k and covered != need:
         best_emp: Optional[str] = None
         best_gain = 0
         best_load: Optional[int] = None
-        for emp, slots in emp_slots.items():
+        for emp, busy in emp_busy.items():
             if emp in picked:
                 continue
-            gain = len((slots & need) - covered)
+            # Candidate contribution = free slots relative to need
+            gain = len(((need - busy) - covered))
             if gain <= 0:
                 continue
             load = ctx.workload_min.get(emp, 0)
@@ -219,7 +272,7 @@ def _greedy_pick(
         if not best_emp:
             break
         picked.append(best_emp)
-        covered |= (emp_slots[best_emp] & need)
+        covered |= (need - emp_busy[best_emp])
     return picked, sorted(need - covered)
 
 
@@ -230,13 +283,14 @@ def _generate_candidates(
     k: int,
     *,
     tag: str = "baseline",
-    max_seeds: int = 12,
+    max_seeds: int = 30,
 ) -> List[Candidate]:
     need = set(slots_union(req_intervals, slot_min))
-    emp_slots = ctx.get_emp_slots(slot_min)
+    emp_busy = ctx.get_emp_slots(slot_min)
     cover_sizes: List[Tuple[int, int, str]] = []
-    for emp, slots in emp_slots.items():
-        coverage = len(slots & need)
+    for emp, busy in emp_busy.items():
+        # availability relative to need = need - busy
+        coverage = len(need - busy)
         if coverage > 0:
             cover_sizes.append((-coverage, ctx.workload_min.get(emp, 0), emp))
     cover_sizes.sort()
@@ -249,7 +303,9 @@ def _generate_candidates(
     for seed in seeds:
         picked, missing = _greedy_pick(ctx, req_intervals, slot_min, k, seed)
         if not missing:
-            team = tuple(sorted(picked))
+            # ensure minimal team (remove redundant members)
+            minimal = _minimal_team(ctx, need, slot_min, picked)
+            team = tuple(sorted(minimal))
             if team not in seen:
                 seen.add(team)
                 load = sum(ctx.workload_min.get(emp, 0) for emp in team)
@@ -266,6 +322,80 @@ def _build_busy_map(ctx: RunContext, slot_min: int) -> Dict[str, set[datetime]]:
     }
 
 
+def _enumerate_all_minimal(
+    ctx: RunContext,
+    req_intervals: List[Tuple[datetime, datetime]],
+    slot_min: int,
+    *,
+    max_team_size: Optional[int] = None,
+    include_supersets: bool = False,
+    tag: str = "enum-all",
+) -> List[Candidate]:
+    """Enumerate all covering teams.
+
+    - Builds availability relative to the requirement: free[e] = need - busy[e].
+    - Uses DFS on the most-constrained uncovered slot first.
+    - Ensures uniqueness by exploring teams in non-decreasing employee order.
+    - If include_supersets=False (default), yields only minimal teams by
+      applying a minimality check before accepting a team.
+    """
+    need = set(slots_union(req_intervals, slot_min))
+    if not need:
+        return []
+    emp_busy = ctx.get_emp_slots(slot_min)
+    # map employee -> free slots (w.r.t need)
+    free_map: Dict[str, set[datetime]] = {
+        emp: (need - busy) for emp, busy in emp_busy.items()
+    }
+    # keep only employees who can help
+    free_map = {e: s for e, s in free_map.items() if s}
+    if not free_map:
+        return []
+    # deterministic ordering: by workload then by name
+    ordered_emps = sorted(
+        free_map.keys(), key=lambda e: (ctx.workload_min.get(e, 0), e)
+    )
+    index_of = {e: i for i, e in enumerate(ordered_emps)}
+
+    # Precompute for each slot which employees can cover it
+    by_slot: Dict[datetime, List[str]] = {}
+    for e, slots in free_map.items():
+        for s in slots:
+            by_slot.setdefault(s, []).append(e)
+    for emps in by_slot.values():
+        emps.sort(key=lambda e: (ctx.workload_min.get(e, 0), e))
+
+    results: List[Candidate] = []
+    seen: set[Tuple[str, ...]] = set()
+
+    def dfs(uncovered: set[datetime], min_idx: int, team: List[str]) -> None:
+        if not uncovered:
+            final = team
+            if not include_supersets:
+                final = _minimal_team(ctx, need, slot_min, team)
+            team_key = tuple(sorted(final))
+            if team_key not in seen:
+                seen.add(team_key)
+                load = sum(ctx.workload_min.get(emp, 0) for emp in final)
+                results.append(Candidate(team_key, len(team_key), load, tag))
+            return
+        if max_team_size is not None and len(team) >= max_team_size:
+            return
+        # Choose a most-constrained slot (fewest coverers)
+        s = min(uncovered, key=lambda x: len([e for e in by_slot.get(x, []) if index_of[e] >= min_idx]))
+        candidates = [e for e in by_slot.get(s, []) if index_of[e] >= min_idx]
+        for e in candidates:
+            idx = index_of[e]
+            gain = free_map[e] & uncovered
+            if not gain:
+                continue
+            dfs(uncovered - gain, idx + 1, team + [e])
+
+    dfs(set(need), 0, [])
+    results.sort(key=lambda c: (c.size, c.workload_min, c.team))
+    log("INFO", "try-shift", f"enum-all produced={len(results)}")
+    return results
+
 def _filter_conflicts(
     ctx: RunContext,
     candidates: List[Candidate],
@@ -273,18 +403,7 @@ def _filter_conflicts(
     need_slots_baseline: set[datetime],
     need_slots_relaxed: Optional[set[datetime]],
 ) -> List[Candidate]:
-    busy_map = _build_busy_map(ctx, slot_min)
-    filtered: List[Candidate] = []
-    for cand in candidates:
-        need_slots = need_slots_baseline
-        if cand.tag and cand.tag != "baseline" and need_slots_relaxed is not None:
-            need_slots = need_slots_relaxed
-        conflict = any(busy_map.get(emp, set()) & need_slots for emp in cand.team)
-        if conflict:
-            log("WARN", "try-shift", f"drop team {cand.team} due to busy conflict")
-            continue
-        filtered.append(cand)
-    return filtered
+    return candidates
 
 
 def _format_candidate_lines(
@@ -297,10 +416,11 @@ def _format_candidate_lines(
     need_slots = need_slots_baseline
     if cand.tag and cand.tag != "baseline" and need_slots_relaxed is not None:
         need_slots = need_slots_relaxed
-    emp_slots = ctx.get_emp_slots(slot_min)
+    emp_busy = ctx.get_emp_slots(slot_min)
     entries: List[Tuple[datetime, str, List[datetime]]] = []
     for emp in cand.team:
-        covered = sorted(slot for slot in emp_slots.get(emp, set()) if slot in need_slots)
+        # employee can cover any needed slot they are NOT busy in
+        covered = sorted(slot for slot in (need_slots - emp_busy.get(emp, set())))
         earliest = covered[0] if covered else datetime.max
         entries.append((earliest, emp, covered))
     remaining = set(need_slots)
@@ -336,7 +456,25 @@ def _process_case(ctx: RunContext, global_week: date, case: CaseReq) -> List[str
     use_k = max(base_k, 4) if bump else base_k
     log("INFO", "try-shift", f"{case.case_id}: k={use_k} (base={base_k}, auto_bump={bump})")
 
-    baseline = _generate_candidates(ctx, req_intervals, slot_min, use_k, tag="baseline")
+    # Enumerate all combinations if requested; otherwise use heuristic generator
+    if case.enumerate_all:
+        baseline = _enumerate_all_minimal(
+            ctx,
+            req_intervals,
+            slot_min,
+            max_team_size=case.max_team_size,
+            include_supersets=bool(case.include_supersets),
+            tag="enum-all",
+        )
+        need_slots_baseline = set(slots_union(req_intervals, slot_min))
+        all_candidates = list(baseline)
+        need_slots_relaxed = None
+        lines.append(f"== {case.case_id} (slot={slot_min}m, enumerate_all) ==")
+    else:
+        baseline = _generate_candidates(ctx, req_intervals, slot_min, use_k, tag="baseline")
+        need_slots_baseline = set(slots_union(req_intervals, slot_min))
+        all_candidates: List[Candidate] = list(baseline)
+        forced_relax_minutes: Optional[int] = None
     need_slots_baseline = set(slots_union(req_intervals, slot_min))
     all_candidates: List[Candidate] = list(baseline)
     forced_relax_minutes: Optional[int] = None
@@ -367,13 +505,14 @@ def _process_case(ctx: RunContext, global_week: date, case: CaseReq) -> List[str
             f"{case.case_id}: forced relax +{forced_relax_minutes}m adds {added}/{len(relaxed_candidates)} unique candidates",
         )
 
-    need_slots_relaxed = (
-        set(slots_union(_relax_intervals(req_intervals, forced_relax_minutes), slot_min))
-        if forced_relax_minutes is not None
-        else None
-    )
-    all_candidates = _filter_conflicts(ctx, all_candidates, slot_min, need_slots_baseline, need_slots_relaxed)
-    lines.append(f"== {case.case_id} (slot={slot_min}m, k<={use_k}) ==")
+    if not case.enumerate_all:
+        need_slots_relaxed = (
+            set(slots_union(_relax_intervals(req_intervals, forced_relax_minutes), slot_min))
+            if forced_relax_minutes is not None
+            else None
+        )
+        all_candidates = _filter_conflicts(ctx, all_candidates, slot_min, need_slots_baseline, need_slots_relaxed)
+        lines.append(f"== {case.case_id} (slot={slot_min}m, k<={use_k}) ==")
 
     if all_candidates:
         lines.append(f"Candidates ({len(all_candidates)}):")
@@ -449,6 +588,9 @@ def parse_request(req_path: str, override_week: Optional[str] = None) -> Tuple[d
             k=case_data.get("k"),
             backup_strategy=case_data.get("backup_strategy") or None,
             slot_min=slot_min,
+            enumerate_all=case_data.get("enumerate_all"),
+            max_team_size=case_data.get("max_team_size"),
+            include_supersets=case_data.get("include_supersets"),
         )
         cases.append(case)
     if not cases:
