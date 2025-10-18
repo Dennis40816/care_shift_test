@@ -28,6 +28,8 @@ APPDATA_BASE = Path(
 APP_DIR = APPDATA_BASE / "CareShift"
 
 SETTINGS_REQ = ROOT / "shift_req.json"
+# Example request used as fallback when SETTINGS_REQ is not packaged
+EXAMPLE_REQ = ROOT / "shift_req.example.json"
 # USER_REQ is resolved against the chosen WORK_DIR later
 USER_REQ: Path
 
@@ -57,9 +59,51 @@ def ensure_work_dir() -> Path:
     work.mkdir(parents=True, exist_ok=True)
     global USER_REQ
     USER_REQ = work / "shift_req.json"
-    if SETTINGS_REQ.exists() and not USER_REQ.exists():
-        shutil.copy2(SETTINGS_REQ, USER_REQ)
-        log(f"created default shift_req.json at {USER_REQ}")
+    # Ensure example file is available in work dir for reference
+    example_target = work / "shift_req.example.json"
+    if EXAMPLE_REQ.exists() and not example_target.exists():
+        try:
+            shutil.copy2(EXAMPLE_REQ, example_target)
+        except Exception:
+            pass
+
+    if not USER_REQ.exists():
+        if SETTINGS_REQ.exists():
+            shutil.copy2(SETTINGS_REQ, USER_REQ)
+            log(f"created default shift_req.json at {USER_REQ}")
+        elif EXAMPLE_REQ.exists():
+            shutil.copy2(EXAMPLE_REQ, USER_REQ)
+            log(f"seeded shift_req.json from example -> {USER_REQ}")
+        else:
+            # last resort: write a minimal template
+            USER_REQ.write_text('''{
+  "week_date": null,
+  "cases": [
+    {
+      "case_id": "Test Only",
+      "k": 3,
+      "slot_min": 30,
+      "days": {
+        "mon": [
+          "16:00-18:00"
+        ],
+        "tue": [
+          "09:30-10:00",
+          "14:00-17:30"
+        ],
+        "wed": [
+          "15:00-17:00"
+        ]
+      },
+      "specific": [],
+      "backup_strategy": {},
+      "enumerate_all": true,
+      "max_team_size": null
+    }
+  ]
+}
+''', encoding="utf-8")
+            log(f"generated minimal shift_req.json -> {USER_REQ}")
     if work == APP_DIR and not ROOT.samefile(work):
         log(f"using APPDATA work dir: {work}")
     else:
