@@ -1,98 +1,104 @@
-## Care Shift Test – Quick Start
+## Care Shift Test
 
-This project automates the Compal weekly shift workflow (login → navigate → import → try_shift report).
+Automates weekly shift handling end‑to‑end: login → navigate → import week → generate shift candidates.
 
-### 1. Install Dependencies (Windows 10)
+—
 
-```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-./install_dependencies.ps1 -InstallTesseract
-```
+### Who you are and how to start
 
-The script will:
+- Dist user (packaged folder):
+  - Unzip `dist/care_shift/` and run `run_care_shift.cmd`. No Python needed.
+  - Optional (for captcha OCR on login): install Tesseract OCR 5.x (UB‑Mannheim build recommended) and make sure `tesseract.exe` is on PATH.
 
-1. Ensure Python 3.12+ is available (installs via `winget` if missing).
-2. Create/refresh the `.venv` virtual environment.
-3. Install all Python dependencies (`pip install -e .`).
-4. Download Playwright browser drivers.
-5. Optionally install Tesseract OCR runtime (`-InstallTesseract`).
+- Developer (from source, recommended with uv):
+  - Install uv (Windows): `winget install -e --id Astral.UV`
+  - Setup project and browsers:
+    - `uv sync`
+    - `uv run python -m playwright install chromium`
+      - Linux extra: `uv run python -m playwright install-deps`
+  - Run: `uv run python src/orchestrator.py`
 
-> **Tip**: rerun the script whenever dependencies need to be refreshed.
+Fallback (Windows only): `./install_dependencies.ps1 -InstallTesseract`
 
-### 2. Launch the Orchestrator
+—
 
-```cmd
-run_try_shift.cmd
-```
+### Working directory and outputs
 
-This starts the interactive menu:
+- Preferred work dir = the executable folder; fallback = `%APPDATA%\CareShift` if exe folder isn’t writable.
+- Results are written to `out/` under the chosen work dir.
+- If `shift_req.json` is missing in the work dir, a default copy is created from the exe folder.
+- Override output folder with env var `SHIFT_OUT_DIR`.
 
-1. Login
-2. Go to week shift
-3. Import week to DB
-4. Try shift (stage 5)
+—
 
-Make sure `shift_req.json` is configured with your cases before running stage 5.
+### Running via orchestrator
 
-### 3. shift_req.json Schema (v1)
+`run_try_shift.cmd` starts an interactive menu:
+- Login → Go to week shift → Import week to DB → Try shift
+
+Make sure `shift_req.json` suits your week/cases before “Try shift”.
+
+—
+
+### Config: shift_req.json (v1)
+
+Minimal example (see `shift_req.example.json` for all options):
 
 ```jsonc
 {
-  "week_date": null,                // optional global week anchor
+  "week_date": null,
   "cases": [
     {
       "case_id": "Example",
-      "week_date": null,           // optional case override
-      "k": 3,                      // max employees for the team
-      "slot_min": 30,              // minimum slot granularity (minutes)
-      "days": {                    // weekly recurring ranges
-        "mon": ["09:00-12:00"],
-        "wed": ["14:00-16:00"]
-      },
-      "specific": [
-        { "date": "2025-10-17", "ranges": ["16:00-18:00"] }
-      ],
-      "backup_strategy": {
-        "type": "relax_minutes",
-        "minutes": 30
-      }
+      "k": 3,
+      "slot_min": 30,
+      "days": { "mon": ["09:00-12:00"], "wed": ["14:00-16:00"] },
+      "specific": [ { "date": "2025-10-17", "ranges": ["16:00-18:00"] } ],
+      "backup_strategy": { "type": "relax_minutes", "minutes": 30 },
+      "enumerate_all": false,
+      "max_team_size": null,
+      "include_supersets": false
     }
   ]
 }
 ```
 
-### 4. Output
+Day keys: `sun, mon, tue, wed, thu, fri, sat`.
 
-Running stage 5 writes `shift_candidates_{timestamp}.txt` with all feasible teams ordered by:
+—
 
-1. Team size (k) – smaller is better.
-2. Weekly load minutes – lower means less overall workload.
-3. Team members (alphabetical) for deterministic ties.
+### Output format
 
-Each coverage line lists the employee and merged time blocks, e.g. `- 陳怡婷: (一) 2025-10-13 16:00 - 18:00`.
+- File: `out/shift_candidates_{timestamp}.txt`
+- Candidate ordering: team size → weekly load minutes → team name
+- Coverage lines are time‑sorted (not grouped by person):
 
-### 5. Helpful Commands
+```
+YYYY-MM-DD (一) HH:MM - HH:MM: 員工姓名
+```
 
-- Reinstall dependencies: `./install_dependencies.ps1`
-- Update Playwright: `.".venv\Scripts\python.exe" -m playwright install`
-- Run orchestrator without script: `.".venv\Scripts\python.exe" src\orchestrator.py`
+—
 
-### 6. Build Standalone Package (PyInstaller)
+### Build a standalone (Windows)
 
-1. Ensure dependencies are installed (`install_dependencies.ps1`) and browsers downloaded.
-2. Execute:
+```powershell
+./build_exe.ps1 -Clean
+```
 
-   ```powershell
-   ./build_exe.ps1 -Clean
-   ```
+Outputs in `dist/care_shift/`:
+- `care_shift.exe`, `ms-playwright/`, `run_care_shift.cmd`
 
-3. Result is under `dist/care_shift/`:
-   - `care_shift.exe`
-   - `ms-playwright/` (bundled Chromium)
-   - `run_care_shift.cmd` (sets `PLAYWRIGHT_BROWSERS_PATH` then launches exe)
+Zip and share the whole folder with users.
 
-Copy the whole folder to the target machine and run `run_care_shift.cmd` to launch without installing Python.
+—
 
-### 7. Support
+### Dependencies (summary)
 
-If anything fails, re-run the installer and review logs in `shift_candidates_*.txt` or the console. The `TODO.md` file tracks roadmap items for future enhancements.
+- Dist users: Windows 10/11 x64; optional Tesseract OCR 5.x if you use the login stage.
+- Developers: uv (recommended), Playwright browsers, optional Tesseract OCR 5.x.
+
+—
+
+### Support
+
+Check console output and files in `out/`. Re‑run `uv sync` or `./install_dependencies.ps1` if environment drifts.

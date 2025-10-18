@@ -499,7 +499,16 @@ class TryShiftEngine:
         self.load_context(week_any)
         try:
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            out_path = f"shift_candidates_{ts}.txt"
+            # Decide output directory
+            import os
+            out_dir_env = os.getenv("SHIFT_OUT_DIR")
+            if out_dir_env:
+                out_dir = Path(out_dir_env)
+            else:
+                base = Path.cwd()
+                out_dir = base / "out"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = str(out_dir / f"shift_candidates_{ts}.txt")
             lines: List[str] = []
             for i, case in enumerate(cases, 1):
                 log("INFO", "try-shift", f"case {i}/{len(cases)}: {case.case_id}")
